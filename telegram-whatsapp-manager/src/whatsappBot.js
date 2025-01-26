@@ -5,7 +5,7 @@ import P from 'pino';
 const logger = P({ timestamp: () => `,"time":"${new Date().toJSON()}"` }, P.destination('./logs/whatsapp-logs.txt'));
 logger.level = 'trace';
 
-export async function createWhatsAppBot(phoneNumber, sendPairingCodeToTelegram) {
+export async function createWhatsAppBot(phoneNumber, sendPairingCodeToTelegram, updateStatus) {
     const { state, saveCreds } = await useMultiFileAuthState(`sessions/${phoneNumber}`);
     const { version } = await fetchLatestBaileysVersion();
 
@@ -18,7 +18,6 @@ export async function createWhatsAppBot(phoneNumber, sendPairingCodeToTelegram) 
             keys: makeCacheableSignalKeyStore(state.keys, logger),
         },
     });
-
 
     if (!sock.authState.creds.registered) {
         try {
@@ -33,10 +32,14 @@ export async function createWhatsAppBot(phoneNumber, sendPairingCodeToTelegram) 
     }
 
     sock.ev.on('connection.update', (update) => {
-        const { connection } = update;
+        const { connection, lastDisconnect } = update;
+        updateStatus(phoneNumber, connection || 'offline');
+        
         if (connection === 'close') {
             console.log(`Bot WhatsApp ${phoneNumber} terputus. Mencoba menghubungkan kembali...`);
-            createWhatsAppBot(phoneNumber, sendPairingCodeToTelegram); // Reconnect
+            if (lastDisconnect?.error?.output?.statusCode !== 401) {
+                createWhatsAppBot(phoneNumber, sendPairingCodeToTelegram, updateStatus); // Reconnect only if not logged out
+            }
         }
     });
 
@@ -55,4 +58,23 @@ export async function createWhatsAppBot(phoneNumber, sendPairingCodeToTelegram) 
     });
 
     return sock;
+}
+
+export function getStoredSessions() {
+    const sessionsPath = 'sessions';
+    if (!fs.existsSync(sessionsPath)) {
+        return [];
+    }
+    
+    return fs.readdirSync(sessionsPath)
+        .filter(file => fs.statSync(`${sessionsPath}/${file}`).isDirectory());
+}
+
+export function deleteSession(phoneNumber) {
+    const sessionPath = `sessions/${phoneNumber}`;
+    if (fs.existsSync(sessionPath)) {
+        fs.rmSync(sessionPath, { recursive: true, force: true });
+        return true;
+    }
+    return false;
 }

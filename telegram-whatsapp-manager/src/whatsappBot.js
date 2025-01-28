@@ -1,135 +1,98 @@
-import { makeWASocket, downloadContentFromMessage, useMultiFileAuthState, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } from '@whiskeysockets/baileys';
+import { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers, proto, makeInMemoryStore, DisconnectReason } from '@whiskeysockets/baileys';
+import { Boom } from '@hapi/boom';
+import chalk from 'chalk';
 import fs from 'fs';
 import P from 'pino';
 import moment from 'moment-timezone';
-import { readDatabase, createDatabase } from './utils.js';
+import axios from 'axios';
+import { exec } from 'child_process';
+import util from 'util';
+import { writeExif } from './lib/sticker.js';
 import { uploadImage } from './lib/uploadImage.js';
+import { db } from './lib/database.js';
 
-const logger = P({ timestamp: () => `,"time":"${new Date().toJSON()}"` }, P.destination('./logs/whatsapp-logs.txt'));
-logger.level = 'trace';
+const store = makeInMemoryStore({
+    logger: P().child({
+        level: 'silent',
+        stream: 'store'
+    })
+});
 
-function salam() {
-    let wishloc = '';
-    const time = moment.tz('Asia/Jakarta').format('HH');
-    wishloc = ('Hi');
-    if (time >= 0) {
-        wishloc = ('Selamat Malam');
-    }
-    if (time >= 4) {
-        wishloc = ('Selamat Pagi');
-    }
-    if (time >= 11) {
-        wishloc = ('Selamat Siang');
-    }
-    if (time >= 15) {
-        wishloc = ('️Selamat Sore');
-    }
-    if (time >= 18) {
-        wishloc = ('Selamat Malam');
-    }
-    if (time >= 23) {
-        wishloc = ('Selamat Malam');
-    }
-    return wishloc;
-}
-
-// Fungsi untuk menampilkan menu
-async function showMenu(sock, jid, sender) {
-    const menuText = `╭─「 *MENU BOT* 」
-│
-│ Halo @${sender.split('@')[0]} 👋
-│ *${salam()} 🌸*
-│
-├─「 List Menu 」
-│ ▸ !menu
-│ ▸ !liststore
-│ ▸ !addlist <nama>
-│
-├─「 Cara Penggunaan 」
-│ 1. !addlist <nama>
-│    ⤷ Untuk menambah item ke list
-│    ⤷ Reply pesan/gambar yang akan
-│      ditambahkan
-│
-│ 2. !liststore
-│    ⤷ Untuk melihat semua item
-│    ⤷ yang tersedia
-│
-│ 3. <nama item>
-│    ⤷ Ketik nama item untuk
-│      mengaksesnya
-│
-╰────
-
-_Note: Hanya admin yang bisa
-menambah/menghapus item_`;
-
-    try {
-        const ppUrl = await sock.profilePictureUrl(jid, 'image');
-        await sock.sendMessage(jid, {
-            text: menuText,
-            mentions: [sender],
-            contextInfo: {
-                externalAdReply: {
-                    title: 'Menu Bot',
-                    body: salam(),
-                    thumbnailUrl: ppUrl,
-                    sourceUrl: "",
-                    mediaType: 1,
-                    renderLargerThumbnail: true,
-                    showAdAttribution: true
-                }
-            }
-        });
-    } catch (error) {
-        // Jika gagal mendapatkan foto profil, kirim tanpa thumbnail
-        await sock.sendMessage(jid, {
-            text: menuText,
-            mentions: [sender]
-        });
-    }
-}
+console.log(chalk.green.bold(`
+    --------------------------------------
+    ☘️ WhatsApp Bot Integration Ready
+    --------------------------------------
+`));
 
 export async function createWhatsAppBot(phoneNumber, sendPairingCodeToTelegram, updateStatus) {
     const { state, saveCreds } = await useMultiFileAuthState(`sessions/${phoneNumber}`);
     const { version } = await fetchLatestBaileysVersion();
 
-    // Inisialisasi database jika belum ada
-    if (!readDatabase(phoneNumber)) {
-        createDatabase(phoneNumber);
-    }
+    console.log(chalk.yellow.bold("📁     Initializing modules..."));
+    console.log(chalk.cyan.bold("- Baileys API Loaded"));
+    console.log(chalk.cyan.bold("- File System Ready"));
 
     const sock = makeWASocket({
         version,
-        logger,
-        printQRInTerminal: false, 
-        auth: {
-            creds: state.creds,
-            keys: makeCacheableSignalKeyStore(state.keys, logger),
-        },
+        logger: P({ level: 'silent' }),
+        printQRInTerminal: false,
+        auth: state,
+        browser: Browsers.ubuntu("Edge"),
+        getMessage: async (key) => {
+            const jid = key.remoteJid;
+            const msg = await store.loadMessage(jid, key.id);
+            return msg?.message || "";
+        }
     });
+
+    store.bind(sock.ev);
 
     if (!sock.authState.creds.registered) {
         try {
-            await sock.waitForConnectionUpdate((up) => !!up.qr)
+            await sock.waitForConnectionUpdate((up) => !!up.qr);
             const code = await sock.requestPairingCode(phoneNumber);
-            console.log(`Pairing code untuk ${phoneNumber}: ${code}`);
+            console.log(chalk.white.bold(`Pairing code untuk ${phoneNumber}: ${code}`));
             sendPairingCodeToTelegram(phoneNumber, code);
         } catch (error) {
-            console.error(`Gagal meminta pairing code untuk ${phoneNumber}:`, error);
+            console.error(chalk.red.bold(`Gagal meminta pairing code untuk ${phoneNumber}:`, error));
             return null;
         }
     }
 
-    sock.ev.on('connection.update', (update) => {
+    sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect } = update;
         updateStatus(phoneNumber, connection || 'offline');
         
         if (connection === 'close') {
-            console.log(`Bot WhatsApp ${phoneNumber} terputus. Mencoba menghubungkan kembali...`);
-            if (lastDisconnect?.error?.output?.statusCode !== 401) {
+            const reason = new Boom(lastDisconnect?.error)?.output.statusCode;
+            console.log(chalk.red.bold("Koneksi ditutup karena: "), lastDisconnect.error);
+
+            if (reason === DisconnectReason.badSession) {
+                console.log(chalk.red.bold("File sesi buruk, Harap hapus sesi dan scan ulang"));
+                deleteSession(phoneNumber);
+            } else if (reason === DisconnectReason.connectionClosed) {
+                console.log(chalk.yellow.bold("Koneksi ditutup, sedang mencoba untuk terhubung kembali..."));
+                createWhatsAppBot(phoneNumber, sendPairingCodeToTelegram, updateStatus);
+            } else if (reason === DisconnectReason.connectionLost) {
+                console.log(chalk.yellow.bold("Koneksi hilang, mencoba untuk terhubung kembali..."));
+                createWhatsAppBot(phoneNumber, sendPairingCodeToTelegram, updateStatus);
+            } else if (reason === DisconnectReason.connectionReplaced) {
+                console.log(chalk.green.bold("Koneksi diganti, sesi lain telah dibuka"));
+                sock.logout();
+            } else if (reason === DisconnectReason.loggedOut) {
+                console.log(chalk.green.bold("Perangkat logout, harap scan ulang"));
+                deleteSession(phoneNumber);
+            } else if (reason === DisconnectReason.restartRequired) {
+                console.log(chalk.green.bold("Restart diperlukan, sedang memulai ulang..."));
+                createWhatsAppBot(phoneNumber, sendPairingCodeToTelegram, updateStatus);
+            } else if (reason === DisconnectReason.timedOut) {
+                console.log(chalk.green.bold("Koneksi waktu habis, sedang mencoba untuk terhubung kembali..."));
                 createWhatsAppBot(phoneNumber, sendPairingCodeToTelegram, updateStatus);
             }
+        } else if (connection === 'connecting') {
+            console.log(chalk.blue.bold("Menghubungkan ke WhatsApp..."));
+        } else if (connection === 'open') {
+            console.log(chalk.green.bold("Bot berhasil terhubung."));
         }
     });
 
@@ -137,149 +100,286 @@ export async function createWhatsAppBot(phoneNumber, sendPairingCodeToTelegram, 
 
     sock.ev.on('messages.upsert', async (m) => {
         const msg = m.messages[0];
-        const jid = msg.key.remoteJid;
+        const content = msg.message;
+        if (!content) return;
         
-        if (!jid || !msg.message || !jid.endsWith('@g.us')) return;
+        const from = msg.key.remoteJid;
+        const isGroup = from.endsWith('@g.us');
+        const sender = msg.key.fromMe ? sock.user.id : isGroup ? msg.key.participant : from;
+        const quoted = msg.quoted || msg;
+        const body = (typeof content === 'string' ? content : content.conversation) || 
+                    (content.imageMessage && content.imageMessage.caption) || 
+                    (content.videoMessage && content.videoMessage.caption) || 
+                    (content.extendedTextMessage && content.extendedTextMessage.text) || '';
         
-        const messageText = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
-        const db = readDatabase(phoneNumber);
+        // Check if sender is owner
+        const isOwner = msg.key.fromMe;
         
-        // Handle menu command
-        if (messageText.toLowerCase() === '!menu') {
-            await showMenu(sock, jid, msg.key.participant);
-            return;
+        // Initialize chat in database if not exists
+        if (isGroup) {
+            db.initChat(from);
         }
 
-        // Handle liststore command
-        if (messageText.match(/^!list(store|shop)?$/i)) {
-            if (!db[jid]?.listStore || Object.keys(db[jid]?.listStore || {}).length === 0) {
-                await sock.sendMessage(jid, { text: 'Belum ada *list store* di grup ini.' });
-                return;
-            }
+        // Handle eval commands
+        if (isOwner) {
+            if (body.startsWith('>') || body.startsWith('eval') || body.startsWith('=>')) {
+                const code = body.replace(/^>|^eval|^=>/, '').trim();
+                let evalCmd;
+                try {
+                    evalCmd = /await/i.test(code)
+                        ? eval(`(async() => { ${code} })()`)
+                        : eval(code);
+                } catch (e) {
+                    evalCmd = e;
+                }
 
-            const groupName = (await sock.groupMetadata(jid)).subject;
-            const items = Object.keys(db[jid].listStore).sort((a, b) => a.localeCompare(b, 'en', { sensitivity: 'base' }));
-            
-            let caption = `「 Hallo 」@${msg.key.participant.split('@')[0]} ^_^\n`;
-            caption += `*${salam()} 🌸*\n\n`;
-            caption += `🚩 List Store *${groupName}*\n`;
-            caption += `┏────✧\n`;
-            
-            items.forEach((item, index) => {
-                caption += `│ ${index + 1}. *${item}*\n`;
-            });
-            
-            caption += `┗──────✧`;
-
-            try {
-                const ppUrl = await sock.profilePictureUrl(jid, 'image');
-                await sock.sendMessage(jid, {
-                    text: caption,
-                    mentions: [msg.key.participant],
-                    contextInfo: {
-                        externalAdReply: {
-                            title: '',
-                            body: '',
-                            thumbnailUrl: ppUrl,
-                            sourceUrl: "",
-                            mediaType: 1,
-                            renderLargerThumbnail: true,
-                            showAdAttribution: true
-                        }
+                new Promise((resolve, reject) => {
+                    try {
+                        resolve(evalCmd);
+                    } catch (err) {
+                        reject(err);
                     }
-                }, { quoted: msg });
-            } catch (error) {
-                // Jika gagal mendapatkan foto profil, kirim pesan tanpa thumbnail
-                await sock.sendMessage(jid, {
-                    text: caption,
-                    mentions: [msg.key.participant]
-                }, { quoted: msg });
-            }
-            return;
-        }
-        
-        // Handle addlist command
-        if (messageText.startsWith('!addlist ')) {
-            // Cek apakah pengirim adalah admin grup
-            const groupMetadata = await sock.groupMetadata(jid);
-            const isAdmin = groupMetadata.participants
-                .filter(p => p.admin)
-                .map(p => p.id)
-                .includes(msg.key.participant);
-                
-            if (!isAdmin) {
-                await sock.sendMessage(jid, { text: 'Maaf, hanya admin yang bisa menggunakan perintah ini!' });
-                return;
-            }
-
-            const listName = messageText.slice(9).trim().toUpperCase();
-            if (!listName) {
-                await sock.sendMessage(jid, { text: 'Format: !addlist <nama>' });
-                return;
-            }
-
-            // Cek quoted message
-            if (!msg.message.extendedTextMessage?.contextInfo?.quotedMessage) {
-                await sock.sendMessage(jid, { text: 'Reply pesan yang ingin ditambahkan ke list!' });
-                return;
-            }
-
-            const quotedMsg = msg.message.extendedTextMessage.contextInfo.quotedMessage;
-
-            // Inisialisasi struktur data jika belum ada
-            if (!db[jid]) db[jid] = {};
-            if (!db[jid].listStore) db[jid].listStore = {};
-
-            // Cek apakah nama list sudah ada
-            if (db[jid].listStore[listName]) {
-                await sock.sendMessage(jid, { text: `'${listName}' sudah ada dalam List store` });
-                return;
-            }
-
-            // Handle jika ada gambar
-            if (quotedMsg.imageMessage) {
-                const buffer = await sock.downloadMediaMessage(msg.message.extendedTextMessage.contextInfo.quotedMessage);
-                const imageUrl = await uploadImage(buffer);
-                
-                db[jid].listStore[listName] = {
-                    image: imageUrl,
-                    text: quotedMsg.imageMessage.caption || ''
-                };
-            } else {
-                // Simpan teks saja
-                db[jid].listStore[listName] = {
-                    text: quotedMsg.conversation || quotedMsg.extendedTextMessage?.text || ''
-                };
-            }
-
-            // Simpan ke database
-            fs.writeFileSync(`./databases/database-${phoneNumber}.json`, JSON.stringify(db, null, 2));
-            
-            await sock.sendMessage(jid, { 
-                text: `Berhasil menambahkan "${listName}" ke List Store.\nAkses dengan mengetik namanya` 
-            });
-            return;
-        }
-        
-        // Handle direct list access (ketik nama item langsung)
-        if (db[jid]?.listStore) {
-            const upperText = messageText.toUpperCase();
-            const item = db[jid].listStore[upperText];
-            
-            if (item) {
-                if (item.image) {
-                    // Kirim gambar dengan caption
-                    await sock.sendMessage(jid, {
-                        image: { url: item.image },
-                        caption: item.text || '',
-                        quoted: msg
+                })
+                    .then((res) => sock.sendMessage(from, { text: util.format(res) }))
+                    .catch((err) => sock.sendMessage(from, { text: util.format(err) }));
+            } else if (body.startsWith('$') || body.startsWith('exec')) {
+                const command = body.replace(/^\$|^exec/, '').trim();
+                try {
+                    exec(command, async (err, stdout) => {
+                        if (err) return sock.sendMessage(from, { text: util.format(err) });
+                        if (stdout) return sock.sendMessage(from, { text: util.format(stdout) });
                     });
-                } else {
-                    // Kirim teks saja
-                    await sock.sendMessage(jid, { 
-                        text: item.text,
-                        quoted: msg
-                    });
+                } catch (e) {
+                    await sock.sendMessage(from, { text: util.format(e) });
+                }
+            }
+        }
+
+        // Command handler
+        if (body.startsWith('!')) {
+            const command = body.slice(1).trim().split(/ +/).shift().toLowerCase();
+            const args = body.slice(1).trim().split(/ +/).slice(1);
+            const text = args.join(' ');
+
+            switch (command) {
+                case 'addlist': {
+                    if (!isGroup) {
+                        await sock.sendMessage(from, { text: 'Perintah ini hanya dapat digunakan dalam grup!' });
+                        return;
+                    }
+
+                    // Check if user is admin
+                    const groupMetadata = await sock.groupMetadata(from);
+                    const isAdmin = groupMetadata.participants.find(p => p.id === sender)?.admin === 'admin';
+                    if (!isAdmin) {
+                        await sock.sendMessage(from, { text: 'Perintah ini hanya dapat digunakan oleh admin grup!' });
+                        return;
+                    }
+
+                    if (!quoted) {
+                        await sock.sendMessage(from, { text: 'Balas pesan dengan perintah !addlist <teks>' });
+                        return;
+                    }
+
+                    if (!text) {
+                        await sock.sendMessage(from, { text: '*🚩 Contoh penggunaan:*\n!addlist Test' });
+                        return;
+                    }
+
+                    let msgs = db.data.chats[from].listStr;
+                    if (text.toUpperCase() in msgs) {
+                        await sock.sendMessage(from, { text: `'${text}' telah terdaftar di List store` });
+                        return;
+                    }
+
+                    if (quoted.msg?.mimetype?.startsWith('image/')) {
+                        const media = await quoted.download();
+                        const link = await uploadImage(media);
+                        
+                        msgs[text.toUpperCase()] = { 
+                            image: link,
+                            text: quoted.text || ''
+                        };
+                    } else {
+                        msgs[text.toUpperCase()] = proto.WebMessageInfo.fromObject(quoted).toJSON();
+                    }
+
+                    db.saveDatabase();
+                    await sock.sendMessage(from, { text: `Berhasil menambahkan "${text}" ke List Store.\n\nAkses dengan mengetik namanya` });
+                    break;
+                }
+
+                case 'liststore': {
+                    if (!isGroup) {
+                        await sock.sendMessage(from, { text: 'Perintah ini hanya dapat digunakan dalam grup!' });
+                        return;
+                    }
+
+                    const anu = db.data.chats[from].listStr;
+                    const res = Object.keys(anu);
+                    
+                    if (res.length > 0) {
+                        const groupName = (await sock.groupMetadata(from)).subject;
+                        const salam = (() => {
+                            const time = moment.tz('Asia/Jakarta').format('HH');
+                            if (time >= 0 && time < 4) return 'Selamat Malam';
+                            if (time >= 4 && time < 11) return 'Selamat Pagi';
+                            if (time >= 11 && time < 15) return 'Selamat Siang';
+                            if (time >= 15 && time < 18) return 'Selamat Sore';
+                            return 'Selamat Malam';
+                        })();
+
+                        let capt = `「 Hallo 」@${sender.split('@')[0]} ^_^\n`;
+                        capt += `*${salam} 🌸*\n\n`;
+                        capt += `🚩 List Store *${groupName}*\n┏────✧\n`;
+
+                        const sortedItems = res.sort((a, b) => a.localeCompare(b, 'en', { sensitivity: 'base' }));
+                        sortedItems.forEach((item, index) => {
+                            capt += `│ ${index + 1}. *${item}*\n`;
+                        });
+                        capt += `┗──────✧`;
+
+                        try {
+                            const ppUrl = await sock.profilePictureUrl(from, 'image');
+                            await sock.sendMessage(from, {
+                                text: capt,
+                                mentions: [sender],
+                                contextInfo: {
+                                    externalAdReply: {
+                                        showAdAttribution: true,
+                                        title: '',
+                                        body: '',
+                                        thumbnailUrl: ppUrl,
+                                        sourceUrl: "",
+                                        mediaType: 1,
+                                        renderLargerThumbnail: true
+                                    }
+                                }
+                            });
+                        } catch (error) {
+                            // If profile picture fails to load, send without it
+                            await sock.sendMessage(from, {
+                                text: capt,
+                                mentions: [sender]
+                            });
+                        }
+                    } else {
+                        await sock.sendMessage(from, { text: 'Belum ada *list store* di grup ini.' });
+                    }
+                    break;
+                }
+
+                case 'brat': {
+                    if (!text) {
+                        await sock.sendMessage(from, { text: '> Reply/Masukan pesan untuk membuat stiker brat' });
+                        return;
+                    }
+
+                    await sock.sendMessage(from, { text: '⏳ Sedang membuat stiker...' });
+
+                    try {
+                        if (text.includes("--animated")) {
+                            const txt = text.replace("--animated", "").trim().split(" ");
+                            const array = [];
+                            const tmpDir = './tmp';
+                            
+                            if (!fs.existsSync(tmpDir)) {
+                                fs.mkdirSync(tmpDir, { recursive: true });
+                            }
+
+                            for (let i = 0; i < txt.length; i++) {
+                                const word = txt.slice(0, i + 1).join(" ");
+                                const { data } = await axios.get(
+                                    `https://aqul-brat.hf.space/api/brat?text=${encodeURIComponent(word)}`,
+                                    { responseType: 'arraybuffer' }
+                                );
+                                const tmpFile = `${tmpDir}/brat_${i}-${Date.now()}.mp4`;
+                                fs.writeFileSync(tmpFile, data);
+                                array.push(tmpFile);
+                            }
+
+                            const fileTxt = `${tmpDir}/cmd-${Date.now()}.txt`;
+                            let content = array.map(file => `file '${file}'\nduration 0.5\n`).join('');
+                            content += `file '${array[array.length - 1]}'\nduration 3\n`;
+                            fs.writeFileSync(fileTxt, content);
+
+                            const output = `${tmpDir}/output-${Date.now()}.mp4`;
+                            await new Promise((resolve, reject) => {
+                                exec(
+                                    `ffmpeg -y -f concat -safe 0 -i ${fileTxt} -vf "fps=30" -c:v libx264 -preset veryfast -pix_fmt yuv420p -t 00:00:10 ${output}`,
+                                    (error) => {
+                                        if (error) reject(error);
+                                        else resolve();
+                                    }
+                                );
+                            });
+
+                            const sticker = await writeExif(
+                                { mimetype: 'video/mp4', data: fs.readFileSync(output) },
+                                { packName: 'WhatsApp Bot', packPublish: 'Bot' }
+                            );
+
+                            await sock.sendMessage(from, { sticker });
+
+                            // Cleanup
+                            array.forEach(file => fs.existsSync(file) && fs.unlinkSync(file));
+                            fs.existsSync(fileTxt) && fs.unlinkSync(fileTxt);
+                            fs.existsSync(output) && fs.unlinkSync(output);
+                        } else {
+                            const { data } = await axios.get(
+                                `https://aqul-brat.hf.space/api/brat?text=${encodeURIComponent(text)}`,
+                                { responseType: 'arraybuffer' }
+                            );
+
+                            const sticker = await writeExif(
+                                { mimetype: 'image/jpeg', data },
+                                { packName: 'WhatsApp Bot', packPublish: 'Bot' }
+                            );
+
+                            await sock.sendMessage(from, { sticker });
+                        }
+                    } catch (error) {
+                        console.error('Error in brat command:', error);
+                        await sock.sendMessage(from, { text: '❌ Gagal membuat stiker brat' });
+                    }
+                    break;
+                }
+
+                case 'sticker':
+                case 's': {
+                    if (!quoted) {
+                        await sock.sendMessage(from, { text: '> Reply foto atau video untuk membuat stiker' });
+                        return;
+                    }
+
+                    const mimetype = quoted.msg?.mimetype || '';
+                    
+                    if (!mimetype.startsWith('image/') && !mimetype.startsWith('video/')) {
+                        await sock.sendMessage(from, { text: '> Media tidak valid. Gunakan foto atau video.' });
+                        return;
+                    }
+
+                    await sock.sendMessage(from, { text: '⏳ Sedang membuat stiker...' });
+
+                    try {
+                        const media = await quoted.download();
+                        
+                        if (mimetype.startsWith('video/') && quoted.seconds > 10) {
+                            await sock.sendMessage(from, { text: '> Video tidak boleh lebih dari 10 detik!' });
+                            return;
+                        }
+
+                        const sticker = await writeExif(
+                            { mimetype, data: media },
+                            { packName: 'WhatsApp Bot', packPublish: 'Bot' }
+                        );
+
+                        await sock.sendMessage(from, { sticker });
+                    } catch (error) {
+                        console.error('Error in sticker command:', error);
+                        await sock.sendMessage(from, { text: '❌ Gagal membuat stiker' });
+                    }
+                    break;
                 }
             }
         }
@@ -291,6 +391,7 @@ export async function createWhatsAppBot(phoneNumber, sendPairingCodeToTelegram, 
 export function getStoredSessions() {
     const sessionsPath = 'sessions';
     if (!fs.existsSync(sessionsPath)) {
+        fs.mkdirSync(sessionsPath, { recursive: true });
         return [];
     }
     

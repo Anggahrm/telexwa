@@ -1,6 +1,7 @@
 import { Telegraf } from 'telegraf';
 import { createWhatsAppBot, getStoredSessions, deleteSession } from './whatsappBot.js';
 import { getDatabase, deleteDatabase } from './lib/database.js';
+import telegramDb from './lib/telegramDatabase.js';
 import fs from 'fs';
 
 const bot = new Telegraf('7196701399:AAGfwUW1PbbVdpHB6JpIO58gsuHB6qWP5ck'); 
@@ -8,39 +9,15 @@ const whatsAppBots = new Map();
 const phoneToChatId = new Map(); 
 const botStatus = new Map();
 
-// User roles and limits
-const userRoles = new Map();
-const ROLE_LIMITS = {
-    'free': 1,
-    'premium': 2,
-    'vip': 3,
-    'vvip': 5
-};
-
 // Initialize developer ID
 const DEVELOPER_ID = 6026583608;
 
-// Initialize user roles (in production this should be stored in a database)
-function initializeUserRole(userId) {
-    if (!userRoles.has(userId)) {
-        userRoles.set(userId, 'free'); // Default role
-    }
-}
-
 function getUserBotCount(userId) {
-    let count = 0;
-    whatsAppBots.forEach((_, phoneNumber) => {
-        if (phoneToChatId.get(phoneNumber) === userId) {
-            count++;
-        }
-    });
-    return count;
+    return telegramDb.getUserBots(userId).length;
 }
 
 function canAddMoreBots(userId) {
-    const role = userRoles.get(userId) || 'free';
-    const currentCount = getUserBotCount(userId);
-    return currentCount < ROLE_LIMITS[role];
+    return telegramDb.canAddMoreBots(userId);
 }
 
 function sendPairingCodeToTelegram(phoneNumber, code) {
@@ -60,7 +37,6 @@ async function loadStoredSessions() {
     const sessions = getStoredSessions();
     for (const phoneNumber of sessions) {
         try {
-            // Initialize database for each stored session
             getDatabase(phoneNumber);
             
             const whatsAppBot = await createWhatsAppBot(phoneNumber, sendPairingCodeToTelegram, updateBotStatus);
@@ -77,11 +53,11 @@ async function loadStoredSessions() {
 
 bot.command('add', async (ctx) => {
     const userId = ctx.from.id;
-    initializeUserRole(userId);
 
     if (!canAddMoreBots(userId)) {
-        const role = userRoles.get(userId);
-        return ctx.reply(`Anda telah mencapai batas maksimal bot untuk role ${role} (${ROLE_LIMITS[role]} bot)`);
+        const user = telegramDb.getUser(userId);
+        const limit = user.role === 'developer' ? '∞' : telegramDb.getRoleLimit(user.role);
+        return ctx.reply(`Anda telah mencapai batas maksimal bot untuk role ${user.role} (${limit} bot)`);
     }
 
     const phoneNumber = ctx.message.text.split(' ')[1]; 
@@ -94,7 +70,6 @@ bot.command('add', async (ctx) => {
     }
 
     try {
-        // Initialize database for new bot
         getDatabase(phoneNumber);
         
         phoneToChatId.set(phoneNumber, ctx.chat.id); 
@@ -102,6 +77,7 @@ bot.command('add', async (ctx) => {
         if (whatsAppBot) {
             whatsAppBots.set(phoneNumber, whatsAppBot);
             botStatus.set(phoneNumber, 'connecting');
+            telegramDb.addUserBot(userId, phoneNumber);
             ctx.reply(`Bot WhatsApp dengan nomor ${phoneNumber} sedang dipersiapkan. Silakan tunggu pairing code.`);
         } else {
             ctx.reply('Gagal membuat bot WhatsApp. Silakan coba lagi.');
@@ -116,14 +92,13 @@ bot.command('list', (ctx) => {
     const userId = ctx.from.id;
     let botsToShow = new Map();
 
-    // If developer, show all bots
-    if (userId === DEVELOPER_ID) {
+    if (telegramDb.isDeveloper(userId)) {
         botsToShow = whatsAppBots;
     } else {
-        // Show only user's bots
-        whatsAppBots.forEach((bot, phoneNumber) => {
-            if (phoneToChatId.get(phoneNumber) === userId) {
-                botsToShow.set(phoneNumber, bot);
+        const userBots = telegramDb.getUserBots(userId);
+        userBots.forEach(phoneNumber => {
+            if (whatsAppBots.has(phoneNumber)) {
+                botsToShow.set(phoneNumber, whatsAppBots.get(phoneNumber));
             }
         });
     }
@@ -135,13 +110,12 @@ bot.command('list', (ctx) => {
     let message = 'Daftar Bot WhatsApp:\n\n';
     botsToShow.forEach((bot, phoneNumber) => {
         const status = bot.user?.connected ? 'open' : 'offline';
-        botStatus.set(phoneNumber, status); // Update status based on actual connection
+        botStatus.set(phoneNumber, status);
         
         message += `📱 ${phoneNumber}\n`;
         message += `└─ Status: ${status === 'open' ? '🟢 Online' : status === 'connecting' ? '🟡 Connecting' : '🔴 Offline'}\n`;
         
-        // Show database stats for developer
-        if (userId === DEVELOPER_ID) {
+        if (telegramDb.isDeveloper(userId)) {
             const db = getDatabase(phoneNumber);
             const chatCount = Object.keys(db.data.chats).length;
             const userCount = Object.keys(db.data.users).length;
@@ -153,12 +127,38 @@ bot.command('list', (ctx) => {
         message += '\n';
     });
 
-    const userRole = userRoles.get(userId) || 'free';
+    const user = telegramDb.getUser(userId);
     const botCount = getUserBotCount(userId);
-    message += `\nRole Anda: ${userRole}\n`;
-    message += `Jumlah bot: ${botCount}/${ROLE_LIMITS[userRole]}`;
+    const limit = user.role === 'developer' ? '∞' : telegramDb.getRoleLimit(user.role);
+    message += `\nRole Anda: ${user.role}\n`;
+    message += `Jumlah bot: ${botCount}/${limit}`;
 
     ctx.reply(message);
+});
+
+bot.command('setrole', (ctx) => {
+    if (!telegramDb.isDeveloper(ctx.from.id)) {
+        return ctx.reply('Anda tidak memiliki akses ke perintah ini.');
+    }
+
+    const args = ctx.message.text.split(' ');
+    if (args.length !== 3) {
+        return ctx.reply('Format: /setrole <userId> <role>');
+    }
+
+    const targetUserId = parseInt(args[1]);
+    const newRole = args[2].toLowerCase();
+
+    if (newRole === 'developer' && ctx.from.id !== DEVELOPER_ID) {
+        return ctx.reply('Anda tidak dapat mengatur role developer.');
+    }
+
+    if (!telegramDb.getRoleLimit(newRole)) {
+        return ctx.reply('Role tidak valid. Role yang tersedia: free, premium, vip, vvip');
+    }
+
+    telegramDb.setUserRole(targetUserId, newRole);
+    ctx.reply(`Role user ${targetUserId} telah diubah menjadi ${newRole}`);
 });
 
 bot.command('restart', async (ctx) => {
@@ -173,8 +173,8 @@ bot.command('restart', async (ctx) => {
         return ctx.reply('Bot WhatsApp dengan nomor tersebut tidak ditemukan.');
     }
 
-    // Check if user owns this bot or is developer
-    if (phoneToChatId.get(phoneNumber) !== userId && userId !== DEVELOPER_ID) {
+    const userBots = telegramDb.getUserBots(userId);
+    if (!userBots.includes(phoneNumber) && !telegramDb.isDeveloper(userId)) {
         return ctx.reply('Anda tidak memiliki akses ke bot ini.');
     }
 
@@ -183,7 +183,6 @@ bot.command('restart', async (ctx) => {
         whatsAppBots.delete(phoneNumber);
         botStatus.set(phoneNumber, 'connecting');
         
-        // Keep the existing database instance
         const newBot = await createWhatsAppBot(phoneNumber, sendPairingCodeToTelegram, updateBotStatus);
         if (newBot) {
             whatsAppBots.set(phoneNumber, newBot);
@@ -209,8 +208,8 @@ bot.command('delete', (ctx) => {
         return ctx.reply('Bot WhatsApp dengan nomor tersebut tidak ditemukan.');
     }
 
-    // Check if user owns this bot or is developer
-    if (phoneToChatId.get(phoneNumber) !== userId && userId !== DEVELOPER_ID) {
+    const userBots = telegramDb.getUserBots(userId);
+    if (!userBots.includes(phoneNumber) && !telegramDb.isDeveloper(userId)) {
         return ctx.reply('Anda tidak memiliki akses ke bot ini.');
     }
 
@@ -219,9 +218,9 @@ bot.command('delete', (ctx) => {
         botStatus.delete(phoneNumber);
         phoneToChatId.delete(phoneNumber);
         
-        // Delete both session and database
         deleteSession(phoneNumber);
         deleteDatabase(phoneNumber);
+        telegramDb.removeUserBot(userId, phoneNumber);
         
         ctx.reply(`Bot WhatsApp ${phoneNumber} telah dihapus.`);
     } catch (error) {
@@ -230,33 +229,9 @@ bot.command('delete', (ctx) => {
     }
 });
 
-// Admin command to set user roles
-bot.command('setrole', (ctx) => {
-    if (ctx.from.id !== DEVELOPER_ID) {
-        return ctx.reply('Anda tidak memiliki akses ke perintah ini.');
-    }
-
-    const args = ctx.message.text.split(' ');
-    if (args.length !== 3) {
-        return ctx.reply('Format: /setrole <userId> <role>');
-    }
-
-    const targetUserId = parseInt(args[1]);
-    const newRole = args[2].toLowerCase();
-
-    if (!ROLE_LIMITS[newRole]) {
-        return ctx.reply('Role tidak valid. Role yang tersedia: free, premium, vip, vvip');
-    }
-
-    userRoles.set(targetUserId, newRole);
-    ctx.reply(`Role user ${targetUserId} telah diubah menjadi ${newRole}`);
-});
-
-// Load stored sessions when bot starts
 loadStoredSessions();
 
 bot.launch();
 
-// Enable graceful stop
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));

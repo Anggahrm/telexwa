@@ -1,4 +1,5 @@
-import { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers, proto, makeInMemoryStore, DisconnectReason } from '@whiskeysockets/baileys';
+import pkg from '@whiskeysockets/baileys';
+const { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers, proto, makeInMemoryStore, DisconnectReason } = pkg;
 import { Boom } from '@hapi/boom';
 import chalk from 'chalk';
 import fs from 'fs';
@@ -9,7 +10,7 @@ import { exec } from 'child_process';
 import util from 'util';
 import { writeExif } from './lib/sticker.js';
 import { uploadImage } from './lib/uploadImage.js';
-import { db } from './lib/database.js';
+import { getDatabase } from './lib/database.js';
 
 const store = makeInMemoryStore({
     logger: P().child({
@@ -27,6 +28,7 @@ console.log(chalk.green.bold(`
 export async function createWhatsAppBot(phoneNumber, sendPairingCodeToTelegram, updateStatus) {
     const { state, saveCreds } = await useMultiFileAuthState(`sessions/${phoneNumber}`);
     const { version } = await fetchLatestBaileysVersion();
+    const db = getDatabase(phoneNumber);
 
     console.log(chalk.yellow.bold("📁     Initializing modules..."));
     console.log(chalk.cyan.bold("- Baileys API Loaded"));
@@ -46,6 +48,55 @@ export async function createWhatsAppBot(phoneNumber, sendPairingCodeToTelegram, 
     });
 
     store.bind(sock.ev);
+
+    async function handleStoredMessage(sock, msg) {
+        const from = msg.key.remoteJid;
+        const sender = msg.key.fromMe ? sock.user.id : msg.key.participant || msg.key.remoteJid;
+        
+        // Get chat and user data
+        const chat = db.initChat(from);
+        const user = db.initUser(sender);
+        
+        // Skip processing if conditions aren't met
+        if (!from.endsWith('@g.us') || from.endsWith('broadcast') || 
+            chat.isBanned || user.banned || msg.key.id.startsWith('BAE5')) {
+            return;
+        }
+        
+        const text = (msg.message?.conversation || 
+                     msg.message?.imageMessage?.caption || 
+                     msg.message?.videoMessage?.caption || 
+                     msg.message?.extendedTextMessage?.text || '').toLowerCase();
+        
+        const msgs = chat.listStr;
+        
+        // Check if message exists in list
+        if (!(text.toUpperCase() in msgs)) return;
+        
+        const storedItem = msgs[text.toUpperCase()];
+        
+        try {
+            if (storedItem.image) {
+                // Send image with caption
+                await sock.sendMessage(from, {
+                    image: { url: storedItem.image },
+                    caption: storedItem.text || '',
+                    mentions: msg.message?.extendedTextMessage?.contextInfo?.mentionedJid || []
+                });
+            } else {
+                // Handle stored message object
+                const messageContent = typeof storedItem === 'string' ? 
+                    JSON.parse(storedItem) : storedItem;
+                    
+                await sock.sendMessage(from, messageContent);
+            }
+        } catch (error) {
+            console.error('Error sending stored message:', error);
+            await sock.sendMessage(from, { 
+                text: '❌ Terjadi kesalahan saat mengirim pesan tersimpan' 
+            });
+        }
+    }
 
     if (!sock.authState.creds.registered) {
         try {
@@ -100,6 +151,11 @@ export async function createWhatsAppBot(phoneNumber, sendPairingCodeToTelegram, 
 
     sock.ev.on('messages.upsert', async (m) => {
         const msg = m.messages[0];
+        if (!msg.message) return;
+        
+        // Handle stored messages first
+        await handleStoredMessage(sock, msg);
+        
         const content = msg.message;
         if (!content) return;
         

@@ -1,5 +1,6 @@
 import { Telegraf } from 'telegraf';
 import { createWhatsAppBot, getStoredSessions, deleteSession } from './whatsappBot.js';
+import { getDatabase, deleteDatabase } from './lib/database.js';
 import fs from 'fs';
 
 const bot = new Telegraf('7196701399:AAGfwUW1PbbVdpHB6JpIO58gsuHB6qWP5ck'); 
@@ -58,10 +59,17 @@ function updateBotStatus(phoneNumber, status) {
 async function loadStoredSessions() {
     const sessions = getStoredSessions();
     for (const phoneNumber of sessions) {
-        const whatsAppBot = await createWhatsAppBot(phoneNumber, sendPairingCodeToTelegram, updateBotStatus);
-        if (whatsAppBot) {
-            whatsAppBots.set(phoneNumber, whatsAppBot);
-            botStatus.set(phoneNumber, 'connecting');
+        try {
+            // Initialize database for each stored session
+            getDatabase(phoneNumber);
+            
+            const whatsAppBot = await createWhatsAppBot(phoneNumber, sendPairingCodeToTelegram, updateBotStatus);
+            if (whatsAppBot) {
+                whatsAppBots.set(phoneNumber, whatsAppBot);
+                botStatus.set(phoneNumber, 'connecting');
+            }
+        } catch (error) {
+            console.error(`Error loading session for ${phoneNumber}:`, error);
         }
     }
     console.log(`Loaded ${sessions.length} stored WhatsApp sessions`);
@@ -85,14 +93,22 @@ bot.command('add', async (ctx) => {
         return ctx.reply('Format nomor tidak valid. Silakan gunakan format: /add 62xxxxx');
     }
 
-    phoneToChatId.set(phoneNumber, ctx.chat.id); 
-    const whatsAppBot = await createWhatsAppBot(phoneNumber, sendPairingCodeToTelegram, updateBotStatus);
-    if (whatsAppBot) {
-        whatsAppBots.set(phoneNumber, whatsAppBot);
-        botStatus.set(phoneNumber, 'connecting');
-        ctx.reply(`Bot WhatsApp dengan nomor ${phoneNumber} sedang dipersiapkan. Silakan tunggu pairing code.`);
-    } else {
-        ctx.reply('Gagal membuat bot WhatsApp. Silakan coba lagi.');
+    try {
+        // Initialize database for new bot
+        getDatabase(phoneNumber);
+        
+        phoneToChatId.set(phoneNumber, ctx.chat.id); 
+        const whatsAppBot = await createWhatsAppBot(phoneNumber, sendPairingCodeToTelegram, updateBotStatus);
+        if (whatsAppBot) {
+            whatsAppBots.set(phoneNumber, whatsAppBot);
+            botStatus.set(phoneNumber, 'connecting');
+            ctx.reply(`Bot WhatsApp dengan nomor ${phoneNumber} sedang dipersiapkan. Silakan tunggu pairing code.`);
+        } else {
+            ctx.reply('Gagal membuat bot WhatsApp. Silakan coba lagi.');
+        }
+    } catch (error) {
+        console.error(`Error creating bot for ${phoneNumber}:`, error);
+        ctx.reply('Terjadi kesalahan saat membuat bot. Silakan coba lagi.');
     }
 });
 
@@ -123,8 +139,15 @@ bot.command('list', (ctx) => {
         
         message += `📱 ${phoneNumber}\n`;
         message += `└─ Status: ${status === 'open' ? '🟢 Online' : status === 'connecting' ? '🟡 Connecting' : '🔴 Offline'}\n`;
+        
+        // Show database stats for developer
         if (userId === DEVELOPER_ID) {
+            const db = getDatabase(phoneNumber);
+            const chatCount = Object.keys(db.data.chats).length;
+            const userCount = Object.keys(db.data.users).length;
             const ownerChatId = phoneToChatId.get(phoneNumber);
+            message += `└─ Chats: ${chatCount}\n`;
+            message += `└─ Users: ${userCount}\n`;
             message += `└─ Owner: ${ownerChatId}\n`;
         }
         message += '\n';
@@ -155,15 +178,22 @@ bot.command('restart', async (ctx) => {
         return ctx.reply('Anda tidak memiliki akses ke bot ini.');
     }
 
-    ctx.reply(`Memulai ulang bot WhatsApp ${phoneNumber}...`);
-    whatsAppBots.delete(phoneNumber);
-    botStatus.set(phoneNumber, 'connecting');
-    const newBot = await createWhatsAppBot(phoneNumber, sendPairingCodeToTelegram, updateBotStatus);
-    if (newBot) {
-        whatsAppBots.set(phoneNumber, newBot);
-        ctx.reply(`Bot WhatsApp ${phoneNumber} telah dimulai ulang.`);
-    } else {
-        ctx.reply(`Gagal memulai ulang bot WhatsApp ${phoneNumber}.`);
+    try {
+        ctx.reply(`Memulai ulang bot WhatsApp ${phoneNumber}...`);
+        whatsAppBots.delete(phoneNumber);
+        botStatus.set(phoneNumber, 'connecting');
+        
+        // Keep the existing database instance
+        const newBot = await createWhatsAppBot(phoneNumber, sendPairingCodeToTelegram, updateBotStatus);
+        if (newBot) {
+            whatsAppBots.set(phoneNumber, newBot);
+            ctx.reply(`Bot WhatsApp ${phoneNumber} telah dimulai ulang.`);
+        } else {
+            ctx.reply(`Gagal memulai ulang bot WhatsApp ${phoneNumber}.`);
+        }
+    } catch (error) {
+        console.error(`Error restarting bot ${phoneNumber}:`, error);
+        ctx.reply(`Terjadi kesalahan saat memulai ulang bot ${phoneNumber}.`);
     }
 });
 
@@ -184,14 +214,19 @@ bot.command('delete', (ctx) => {
         return ctx.reply('Anda tidak memiliki akses ke bot ini.');
     }
 
-    whatsAppBots.delete(phoneNumber);
-    botStatus.delete(phoneNumber);
-    phoneToChatId.delete(phoneNumber);
-    
-    if (deleteSession(phoneNumber)) {
+    try {
+        whatsAppBots.delete(phoneNumber);
+        botStatus.delete(phoneNumber);
+        phoneToChatId.delete(phoneNumber);
+        
+        // Delete both session and database
+        deleteSession(phoneNumber);
+        deleteDatabase(phoneNumber);
+        
         ctx.reply(`Bot WhatsApp ${phoneNumber} telah dihapus.`);
-    } else {
-        ctx.reply(`Gagal menghapus sesi bot WhatsApp ${phoneNumber}.`);
+    } catch (error) {
+        console.error(`Error deleting bot ${phoneNumber}:`, error);
+        ctx.reply(`Terjadi kesalahan saat menghapus bot ${phoneNumber}.`);
     }
 });
 

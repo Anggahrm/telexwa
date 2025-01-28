@@ -4,7 +4,7 @@ RUN apt-get update && \
   apt-get upgrade -y && \
   rm -rf /var/lib/apt/lists/*
 
-COPY telegram/whatsapp/manager/package.json .
+COPY telegram-whatsapp-manager/package.json .
 
 RUN npm install
 

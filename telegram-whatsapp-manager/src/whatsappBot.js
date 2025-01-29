@@ -1,5 +1,14 @@
 import pkg from '@whiskeysockets/baileys';
-const { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers, proto, makeInMemoryStore, DisconnectReason } = pkg;
+const { 
+    useMultiFileAuthState, 
+    fetchLatestBaileysVersion, 
+    Browsers, 
+    makeInMemoryStore, 
+    DisconnectReason,
+    generateWAMessage,
+    getAggregateVotesInPollMessage,
+    areJidsSameUser
+} = pkg;
 import { Boom } from '@hapi/boom';
 import chalk from 'chalk';
 import fs from 'fs';
@@ -11,6 +20,8 @@ import util from 'util';
 import { writeExif } from './lib/sticker.js';
 import { uploadImage } from './lib/uploadImage.js';
 import { getDatabase } from './lib/database.js';
+import makeWASocket from './lib/simple.js';
+import serialize from './lib/serialize.js';
 
 const store = makeInMemoryStore({
     logger: P().child({
@@ -45,55 +56,44 @@ export async function createWhatsAppBot(phoneNumber, sendPairingCodeToTelegram, 
             const msg = await store.loadMessage(jid, key.id);
             return msg?.message || "";
         }
-    });
+    }, store);
 
     store.bind(sock.ev);
 
-    async function handleStoredMessage(sock, msg) {
-        const from = msg.key.remoteJid;
-        const sender = msg.key.fromMe ? sock.user.id : msg.key.participant || msg.key.remoteJid;
+    async function handleStoredMessage(m) {
+        if (!m.isGroup || m.key.id.startsWith('BAE5')) return;
         
-        // Get chat and user data
-        const chat = db.initChat(from);
-        const user = db.initUser(sender);
+        const chat = db.initChat(m.cht);
+        const user = db.initUser(m.sender);
         
-        // Skip processing if conditions aren't met
-        if (!from.endsWith('@g.us') || from.endsWith('broadcast') || 
-            chat.isBanned || user.banned || msg.key.id.startsWith('BAE5')) {
-            return;
-        }
-        
-        const text = (msg.message?.conversation || 
-                     msg.message?.imageMessage?.caption || 
-                     msg.message?.videoMessage?.caption || 
-                     msg.message?.extendedTextMessage?.text || '').toLowerCase();
+        if (chat.isBanned || user.banned) return;
         
         const msgs = chat.listStr;
+        const text = m.body.toUpperCase();
         
-        // Check if message exists in list
-        if (!(text.toUpperCase() in msgs)) return;
+        if (!(text in msgs)) return;
         
-        const storedItem = msgs[text.toUpperCase()];
+        const storedItem = msgs[text];
         
         try {
-            if (storedItem.image) {
-                // Send image with caption
-                await sock.sendMessage(from, {
-                    image: { url: storedItem.image },
-                    caption: storedItem.text || '',
-                    mentions: msg.message?.extendedTextMessage?.contextInfo?.mentionedJid || []
-                });
-            } else {
-                // Handle stored message object
-                const messageContent = typeof storedItem === 'string' ? 
-                    JSON.parse(storedItem) : storedItem;
-                    
-                await sock.sendMessage(from, messageContent);
+            if (storedItem && typeof storedItem === 'object') {
+                if (storedItem.image) {
+                    await sock.sendMessage(m.cht, {
+                        image: { url: storedItem.image },
+                        caption: storedItem.text || '',
+                        mentions: m.mentions
+                    });
+                } else if (storedItem.text) {
+                    await sock.sendMessage(m.cht, {
+                        text: storedItem.text,
+                        mentions: m.mentions
+                    });
+                }
             }
         } catch (error) {
             console.error('Error sending stored message:', error);
-            await sock.sendMessage(from, { 
-                text: '❌ Terjadi kesalahan saat mengirim pesan tersimpan' 
+            await sock.sendMessage(m.cht, { 
+                text: '❌ Error sending stored message' 
             });
         }
     }
@@ -102,10 +102,10 @@ export async function createWhatsAppBot(phoneNumber, sendPairingCodeToTelegram, 
         try {
             await sock.waitForConnectionUpdate((up) => !!up.qr);
             const code = await sock.requestPairingCode(phoneNumber);
-            console.log(chalk.white.bold(`Pairing code untuk ${phoneNumber}: ${code}`));
+            console.log(chalk.white.bold(`Pairing code for ${phoneNumber}: ${code}`));
             sendPairingCodeToTelegram(phoneNumber, code);
         } catch (error) {
-            console.error(chalk.red.bold(`Gagal meminta pairing code untuk ${phoneNumber}:`, error));
+            console.error(chalk.red.bold(`Failed to request pairing code for ${phoneNumber}:`, error));
             return null;
         }
     }
@@ -116,326 +116,304 @@ export async function createWhatsAppBot(phoneNumber, sendPairingCodeToTelegram, 
         
         if (connection === 'close') {
             const reason = new Boom(lastDisconnect?.error)?.output.statusCode;
-            console.log(chalk.red.bold("Koneksi ditutup karena: "), lastDisconnect.error);
+            console.log(chalk.red.bold("Connection closed due to: "), lastDisconnect.error);
 
             if (reason === DisconnectReason.badSession) {
-                console.log(chalk.red.bold("File sesi buruk, Harap hapus sesi dan scan ulang"));
+                console.log(chalk.red.bold("Bad session file, please delete session and scan again"));
                 deleteSession(phoneNumber);
             } else if (reason === DisconnectReason.connectionClosed) {
-                console.log(chalk.yellow.bold("Koneksi ditutup, sedang mencoba untuk terhubung kembali..."));
+                console.log(chalk.yellow.bold("Connection closed, reconnecting..."));
                 createWhatsAppBot(phoneNumber, sendPairingCodeToTelegram, updateStatus);
             } else if (reason === DisconnectReason.connectionLost) {
-                console.log(chalk.yellow.bold("Koneksi hilang, mencoba untuk terhubung kembali..."));
+                console.log(chalk.yellow.bold("Connection lost, trying to reconnect..."));
                 createWhatsAppBot(phoneNumber, sendPairingCodeToTelegram, updateStatus);
             } else if (reason === DisconnectReason.connectionReplaced) {
-                console.log(chalk.green.bold("Koneksi diganti, sesi lain telah dibuka"));
+                console.log(chalk.green.bold("Connection replaced, another session opened"));
                 sock.logout();
             } else if (reason === DisconnectReason.loggedOut) {
-                console.log(chalk.green.bold("Perangkat logout, harap scan ulang"));
+                console.log(chalk.green.bold("Device logged out, please scan again"));
                 deleteSession(phoneNumber);
             } else if (reason === DisconnectReason.restartRequired) {
-                console.log(chalk.green.bold("Restart diperlukan, sedang memulai ulang..."));
+                console.log(chalk.green.bold("Restart required, restarting..."));
                 createWhatsAppBot(phoneNumber, sendPairingCodeToTelegram, updateStatus);
             } else if (reason === DisconnectReason.timedOut) {
-                console.log(chalk.green.bold("Koneksi waktu habis, sedang mencoba untuk terhubung kembali..."));
+                console.log(chalk.green.bold("Connection timed out, reconnecting..."));
                 createWhatsAppBot(phoneNumber, sendPairingCodeToTelegram, updateStatus);
             }
         } else if (connection === 'connecting') {
-            console.log(chalk.blue.bold("Menghubungkan ke WhatsApp..."));
+            console.log(chalk.blue.bold("Connecting to WhatsApp..."));
         } else if (connection === 'open') {
-            console.log(chalk.green.bold("Bot berhasil terhubung."));
+            console.log(chalk.green.bold("Bot successfully connected."));
         }
     });
 
     sock.ev.on('creds.update', saveCreds);
 
-    sock.ev.on('messages.upsert', async (m) => {
-        const msg = m.messages[0];
-        if (!msg.message) return;
-        
-        // Handle stored messages first
-        await handleStoredMessage(sock, msg);
-        
-        const content = msg.message;
-        if (!content) return;
-        
-        const from = msg.key.remoteJid;
-        const isGroup = from.endsWith('@g.us');
-        const sender = msg.key.fromMe ? sock.user.id : isGroup ? msg.key.participant : from;
-        const quoted = msg.quoted || msg;
-        const body = (typeof content === 'string' ? content : content.conversation) || 
-                    (content.imageMessage && content.imageMessage.caption) || 
-                    (content.videoMessage && content.videoMessage.caption) || 
-                    (content.extendedTextMessage && content.extendedTextMessage.text) || '';
-        
-        // Check if sender is owner
-        const isOwner = msg.key.fromMe;
-        
-        // Initialize chat in database if not exists
-        if (isGroup) {
-            db.initChat(from);
-        }
+    sock.ev.on('messages.upsert', async (chatUpdate) => {
+        try {
+            if (!chatUpdate.messages) return;
+            const msg = chatUpdate.messages[0];
+            if (!msg.message) return;
+            
+            const m = await serialize(msg, sock, store);
+            if (!m) return;
+            
+            if (m.isBot) return;
+            
+            // Handle stored messages
+            await handleStoredMessage(m);
+            
+            // Handle commands
+            if (m.body.startsWith('!')) {
+                const command = m.command;
+                const args = m.args;
+                const text = m.text;
 
-        // Handle eval commands
-        if (isOwner) {
-            if (body.startsWith('>') || body.startsWith('eval') || body.startsWith('=>')) {
-                const code = body.replace(/^>|^eval|^=>/, '').trim();
-                let evalCmd;
-                try {
-                    evalCmd = /await/i.test(code)
-                        ? eval(`(async() => { ${code} })()`)
-                        : eval(code);
-                } catch (e) {
-                    evalCmd = e;
-                }
-
-                new Promise((resolve, reject) => {
-                    try {
-                        resolve(evalCmd);
-                    } catch (err) {
-                        reject(err);
-                    }
-                })
-                    .then((res) => sock.sendMessage(from, { text: util.format(res) }))
-                    .catch((err) => sock.sendMessage(from, { text: util.format(err) }));
-            } else if (body.startsWith('$') || body.startsWith('exec')) {
-                const command = body.replace(/^\$|^exec/, '').trim();
-                try {
-                    exec(command, async (err, stdout) => {
-                        if (err) return sock.sendMessage(from, { text: util.format(err) });
-                        if (stdout) return sock.sendMessage(from, { text: util.format(stdout) });
-                    });
-                } catch (e) {
-                    await sock.sendMessage(from, { text: util.format(e) });
-                }
-            }
-        }
-
-        // Command handler
-        if (body.startsWith('!')) {
-            const command = body.slice(1).trim().split(/ +/).shift().toLowerCase();
-            const args = body.slice(1).trim().split(/ +/).slice(1);
-            const text = args.join(' ');
-
-            switch (command) {
-                case 'addlist': {
-                    if (!isGroup) {
-                        await sock.sendMessage(from, { text: 'Perintah ini hanya dapat digunakan dalam grup!' });
-                        return;
-                    }
-
-                    // Check if user is admin
-                    const groupMetadata = await sock.groupMetadata(from);
-                    const isAdmin = groupMetadata.participants.find(p => p.id === sender)?.admin === 'admin';
-                    if (!isAdmin) {
-                        await sock.sendMessage(from, { text: 'Perintah ini hanya dapat digunakan oleh admin grup!' });
-                        return;
-                    }
-
-                    if (!quoted) {
-                        await sock.sendMessage(from, { text: 'Balas pesan dengan perintah !addlist <teks>' });
-                        return;
-                    }
-
-                    if (!text) {
-                        await sock.sendMessage(from, { text: '*🚩 Contoh penggunaan:*\n!addlist Test' });
-                        return;
-                    }
-
-                    let msgs = db.data.chats[from].listStr;
-                    if (text.toUpperCase() in msgs) {
-                        await sock.sendMessage(from, { text: `'${text}' telah terdaftar di List store` });
-                        return;
-                    }
-
-                    if (quoted.msg?.mimetype?.startsWith('image/')) {
-                        const media = await quoted.download();
-                        const link = await uploadImage(media);
-                        
-                        msgs[text.toUpperCase()] = { 
-                            image: link,
-                            text: quoted.text || ''
-                        };
-                    } else {
-                        msgs[text.toUpperCase()] = proto.WebMessageInfo.fromObject(quoted).toJSON();
-                    }
-
-                    db.saveDatabase();
-                    await sock.sendMessage(from, { text: `Berhasil menambahkan "${text}" ke List Store.\n\nAkses dengan mengetik namanya` });
-                    break;
-                }
-
-                case 'liststore': {
-                    if (!isGroup) {
-                        await sock.sendMessage(from, { text: 'Perintah ini hanya dapat digunakan dalam grup!' });
-                        return;
-                    }
-
-                    const anu = db.data.chats[from].listStr;
-                    const res = Object.keys(anu);
-                    
-                    if (res.length > 0) {
-                        const groupName = (await sock.groupMetadata(from)).subject;
-                        const salam = (() => {
-                            const time = moment.tz('Asia/Jakarta').format('HH');
-                            if (time >= 0 && time < 4) return 'Selamat Malam';
-                            if (time >= 4 && time < 11) return 'Selamat Pagi';
-                            if (time >= 11 && time < 15) return 'Selamat Siang';
-                            if (time >= 15 && time < 18) return 'Selamat Sore';
-                            return 'Selamat Malam';
-                        })();
-
-                        let capt = `「 Hallo 」@${sender.split('@')[0]} ^_^\n`;
-                        capt += `*${salam} 🌸*\n\n`;
-                        capt += `🚩 List Store *${groupName}*\n┏────✧\n`;
-
-                        const sortedItems = res.sort((a, b) => a.localeCompare(b, 'en', { sensitivity: 'base' }));
-                        sortedItems.forEach((item, index) => {
-                            capt += `│ ${index + 1}. *${item}*\n`;
-                        });
-                        capt += `┗──────✧`;
-
-                        try {
-                            const ppUrl = await sock.profilePictureUrl(from, 'image');
-                            await sock.sendMessage(from, {
-                                text: capt,
-                                mentions: [sender],
-                                contextInfo: {
-                                    externalAdReply: {
-                                        showAdAttribution: true,
-                                        title: '',
-                                        body: '',
-                                        thumbnailUrl: ppUrl,
-                                        sourceUrl: "",
-                                        mediaType: 1,
-                                        renderLargerThumbnail: true
-                                    }
-                                }
-                            });
-                        } catch (error) {
-                            // If profile picture fails to load, send without it
-                            await sock.sendMessage(from, {
-                                text: capt,
-                                mentions: [sender]
-                            });
-                        }
-                    } else {
-                        await sock.sendMessage(from, { text: 'Belum ada *list store* di grup ini.' });
-                    }
-                    break;
-                }
-
-                case 'brat': {
-                    if (!text) {
-                        await sock.sendMessage(from, { text: '> Reply/Masukan pesan untuk membuat stiker brat' });
-                        return;
-                    }
-
-                    await sock.sendMessage(from, { text: '⏳ Sedang membuat stiker...' });
-
-                    try {
-                        if (text.includes("--animated")) {
-                            const txt = text.replace("--animated", "").trim().split(" ");
-                            const array = [];
-                            const tmpDir = './tmp';
-                            
-                            if (!fs.existsSync(tmpDir)) {
-                                fs.mkdirSync(tmpDir, { recursive: true });
-                            }
-
-                            for (let i = 0; i < txt.length; i++) {
-                                const word = txt.slice(0, i + 1).join(" ");
-                                const { data } = await axios.get(
-                                    `https://aqul-brat.hf.space/api/brat?text=${encodeURIComponent(word)}`,
-                                    { responseType: 'arraybuffer' }
-                                );
-                                const tmpFile = `${tmpDir}/brat_${i}-${Date.now()}.mp4`;
-                                fs.writeFileSync(tmpFile, data);
-                                array.push(tmpFile);
-                            }
-
-                            const fileTxt = `${tmpDir}/cmd-${Date.now()}.txt`;
-                            let content = array.map(file => `file '${file}'\nduration 0.5\n`).join('');
-                            content += `file '${array[array.length - 1]}'\nduration 3\n`;
-                            fs.writeFileSync(fileTxt, content);
-
-                            const output = `${tmpDir}/output-${Date.now()}.mp4`;
-                            await new Promise((resolve, reject) => {
-                                exec(
-                                    `ffmpeg -y -f concat -safe 0 -i ${fileTxt} -vf "fps=30" -c:v libx264 -preset veryfast -pix_fmt yuv420p -t 00:00:10 ${output}`,
-                                    (error) => {
-                                        if (error) reject(error);
-                                        else resolve();
-                                    }
-                                );
-                            });
-
-                            const sticker = await writeExif(
-                                { mimetype: 'video/mp4', data: fs.readFileSync(output) },
-                                { packName: 'WhatsApp Bot', packPublish: 'Bot' }
-                            );
-
-                            await sock.sendMessage(from, { sticker });
-
-                            // Cleanup
-                            array.forEach(file => fs.existsSync(file) && fs.unlinkSync(file));
-                            fs.existsSync(fileTxt) && fs.unlinkSync(fileTxt);
-                            fs.existsSync(output) && fs.unlinkSync(output);
-                        } else {
-                            const { data } = await axios.get(
-                                `https://aqul-brat.hf.space/api/brat?text=${encodeURIComponent(text)}`,
-                                { responseType: 'arraybuffer' }
-                            );
-
-                            const sticker = await writeExif(
-                                { mimetype: 'image/jpeg', data },
-                                { packName: 'WhatsApp Bot', packPublish: 'Bot' }
-                            );
-
-                            await sock.sendMessage(from, { sticker });
-                        }
-                    } catch (error) {
-                        console.error('Error in brat command:', error);
-                        await sock.sendMessage(from, { text: '❌ Gagal membuat stiker brat' });
-                    }
-                    break;
-                }
-
-                case 'sticker':
-                case 's': {
-                    if (!quoted) {
-                        await sock.sendMessage(from, { text: '> Reply foto atau video untuk membuat stiker' });
-                        return;
-                    }
-
-                    const mimetype = quoted.msg?.mimetype || '';
-                    
-                    if (!mimetype.startsWith('image/') && !mimetype.startsWith('video/')) {
-                        await sock.sendMessage(from, { text: '> Media tidak valid. Gunakan foto atau video.' });
-                        return;
-                    }
-
-                    await sock.sendMessage(from, { text: '⏳ Sedang membuat stiker...' });
-
-                    try {
-                        const media = await quoted.download();
-                        
-                        if (mimetype.startsWith('video/') && quoted.seconds > 10) {
-                            await sock.sendMessage(from, { text: '> Video tidak boleh lebih dari 10 detik!' });
+                switch (command) {
+                    case 'addlist': {
+                        if (!m.isGroup) {
+                            await m.reply('This command can only be used in groups!');
                             return;
                         }
 
-                        const sticker = await writeExif(
-                            { mimetype, data: media },
-                            { packName: 'WhatsApp Bot', packPublish: 'Bot' }
-                        );
+                        if (!m.isAdmin) {
+                            await m.reply('This command can only be used by group admins!');
+                            return;
+                        }
 
-                        await sock.sendMessage(from, { sticker });
-                    } catch (error) {
-                        console.error('Error in sticker command:', error);
-                        await sock.sendMessage(from, { text: '❌ Gagal membuat stiker' });
+                        if (!m.quoted) {
+                            await m.reply('Reply to a message with !addlist <text>');
+                            return;
+                        }
+
+                        if (!text) {
+                            await m.reply('*🚩 Example:*\n!addlist Test');
+                            return;
+                        }
+
+                        let msgs = db.data.chats[m.cht].listStr;
+                        if (text.toUpperCase() in msgs) {
+                            await m.reply(`'${text}' already exists in List store`);
+                            return;
+                        }
+
+                        if (m.quoted.isMedia) {
+                            const media = await m.quoted.download();
+                            const link = await uploadImage(media);
+                            
+                            msgs[text.toUpperCase()] = { 
+                                image: link,
+                                text: m.quoted.text || ''
+                            };
+                        } else {
+                            msgs[text.toUpperCase()] = {
+                                text: m.quoted.text || m.quoted.body || ''
+                            };
+                        }
+
+                        db.saveDatabase();
+                        await m.reply(`Successfully added "${text}" to List Store.\n\nAccess by typing its name`);
+                        break;
                     }
-                    break;
+
+                    case 'dellist': {
+                        if (!m.isGroup) {
+                            await m.reply('This command can only be used in groups!');
+                            return;
+                        }
+
+                        if (!m.isAdmin) {
+                            await m.reply('This command can only be used by group admins!');
+                            return;
+                        }
+
+                        if (!text) {
+                            await m.reply('*🚩 Example:*\n!dellist <name>\n\nUse !liststore to see available items.');
+                            return;
+                        }
+
+                        const upperText = text.toUpperCase();
+                        let msgs = db.data.chats[m.cht].listStr;
+
+                        if (!(upperText in msgs)) {
+                            await m.reply(`'${text}' is not registered in the List store`);
+                            return;
+                        }
+
+                        delete msgs[upperText];
+                        db.saveDatabase();
+                        await m.reply(`Successfully deleted '${text}' from List Store.`);
+                        break;
+                    }
+
+                    case 'liststore': {
+                        if (!m.isGroup) {
+                            await m.reply('This command can only be used in groups!');
+                            return;
+                        }
+
+                        const items = Object.keys(db.data.chats[m.cht].listStr);
+                        
+                        if (items.length > 0) {
+                            const groupName = m.metadata.subject;
+                            const salam = (() => {
+                                const time = moment.tz('Asia/Jakarta').format('HH');
+                                if (time >= 0 && time < 4) return 'Good Night';
+                                if (time >= 4 && time < 11) return 'Good Morning';
+                                if (time >= 11 && time < 15) return 'Good Afternoon';
+                                if (time >= 15 && time < 18) return 'Good Evening';
+                                return 'Good Night';
+                            })();
+
+                            let capt = `「 Hello 」@${m.sender.split('@')[0]} ^_^\n`;
+                            capt += `*${salam} 🌸*\n\n`;
+                            capt += `🚩 List Store *${groupName}*\n┏────✧\n`;
+
+                            items.sort((a, b) => a.localeCompare(b, 'en', { sensitivity: 'base' }))
+                                 .forEach((item, index) => {
+                                capt += `│ ${index + 1}. *${item}*\n`;
+                            });
+                            capt += `┗──────✧`;
+
+                            await m.reply(capt);
+                        } else {
+                            await m.reply('No *list store* items in this group.');
+                        }
+                        break;
+                    }
+
+                    case 'brat': {
+                        if (!text) {
+                            await m.reply('> Reply/Enter message to create brat sticker');
+                            return;
+                        }
+
+                        await m.reply('⏳ Creating sticker...');
+
+                        try {
+                            if (text.includes("--animated")) {
+                                const txt = text.replace("--animated", "").trim().split(" ");
+                                const array = [];
+                                const tmpDir = './tmp';
+                                
+                                if (!fs.existsSync(tmpDir)) {
+                                    fs.mkdirSync(tmpDir, { recursive: true });
+                                }
+
+                                for (let i = 0; i < txt.length; i++) {
+                                    const word = txt.slice(0, i + 1).join(" ");
+                                    const { data } = await axios.get(
+                                        `https://aqul-brat.hf.space/api/brat?text=${encodeURIComponent(word)}`,
+                                        { responseType: 'arraybuffer' }
+                                    );
+                                    const tmpFile = `${tmpDir}/brat_${i}-${Date.now()}.mp4`;
+                                    fs.writeFileSync(tmpFile, data);
+                                    array.push(tmpFile);
+                                }
+
+                                const fileTxt = `${tmpDir}/cmd-${Date.now()}.txt`;
+                                let content = array.map(file => `file '${file}'\nduration 0.5\n`).join('');
+                                content += `file '${array[array.length - 1]}'\nduration 3\n`;
+                                fs.writeFileSync(fileTxt, content);
+
+                                const output = `${tmpDir}/output-${Date.now()}.mp4`;
+                                await new Promise((resolve, reject) => {
+                                    exec(
+                                        `ffmpeg -y -f concat -safe 0 -i ${fileTxt} -vf "fps=30" -c:v libx264 -preset veryfast -pix_fmt yuv420p -t 00:00:10 ${output}`,
+                                        (error) => {
+                                            if (error) reject(error);
+                                            else resolve();
+                                        }
+                                    );
+                                });
+
+                                const sticker = await writeExif(
+                                    { mimetype: 'video/mp4', data: fs.readFileSync(output) },
+                                    { packName: 'WhatsApp Bot', packPublish: 'Bot' }
+                                );
+
+                                await sock.sendMessage(m.cht, { sticker });
+
+                                // Cleanup
+                                array.forEach(file => fs.existsSync(file) && fs.unlinkSync(file));
+                                fs.existsSync(fileTxt) && fs.unlinkSync(fileTxt);
+                                fs.existsSync(output) && fs.unlinkSync(output);
+                            } else {
+                                const { data } = await axios.get(
+                                    `https://aqul-brat.hf.space/api/brat?text=${encodeURIComponent(text)}`,
+                                    { responseType: 'arraybuffer' }
+                                );
+
+                                const sticker = await writeExif(
+                                    { mimetype: 'image/jpeg', data },
+                                    { packName: 'WhatsApp Bot', packPublish: 'Bot' }
+                                );
+
+                                await sock.sendMessage(m.cht, { sticker });
+                            }
+                        } catch (error) {
+                            console.error('Error in brat command:', error);
+                            await m.reply('❌ Failed to create brat sticker');
+                        }
+                        break;
+                    }
+
+                    case 'sticker':
+                    case 's': {
+                        if (!m.quoted) {
+                            await m.reply('> Reply to photo or video to create sticker');
+                            return;
+                        }
+
+                        if (!m.quoted.isMedia) {
+                            await m.reply('> Invalid media. Use photo or video.');
+                            return;
+                        }
+
+                        await m.reply('⏳ Creating sticker...');
+
+                        try {
+                            const media = await m.quoted.download();
+                            
+                            if (m.quoted.msg.mimetype.startsWith('video/') && m.quoted.msg.seconds > 10) {
+                                await m.reply('> Video must not be longer than 10 seconds!');
+                                return;
+                            }
+
+                            const sticker = await writeExif(
+                                { mimetype: m.quoted.msg.mimetype, data: media },
+                                { packName: 'WhatsApp Bot', packPublish: 'Bot' }
+                            );
+
+                            await sock.sendMessage(m.cht, { sticker });
+                        } catch (error) {
+                            console.error('Error in sticker command:', error);
+                            await m.reply('❌ Failed to create sticker');
+                        }
+                        break;
+                    }
+                }
+            }
+        } catch (error) {
+            console.error('Error processing message:', error);
+        }
+    });
+
+    sock.ev.on('messages.update', async (chatUpdate) => {
+        for (const { key, update } of chatUpdate) {
+            if (update.pollUpdates && key.fromMe) {
+                const pollCreation = await sock.getMessage(key);
+                if (pollCreation) {
+                    const pollUpdate = await getAggregateVotesInPollMessage({
+                        message: pollCreation.message,
+                        pollUpdates: update.pollUpdates,
+                    });
+                    const toCmd = pollUpdate.filter((v) => v.voters.length !== 0)[0]?.name;
+                    if (toCmd) {
+                        const m = await serialize(pollCreation, sock, store);
+                        await m.emit(toCmd);
+                        await sock.sendMessage(key.remoteJid, { delete: key });
+                    }
                 }
             }
         }

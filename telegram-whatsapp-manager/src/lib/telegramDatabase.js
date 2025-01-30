@@ -1,4 +1,5 @@
 import fs from 'fs';
+import config from '../config.js';
 
 class TelegramDatabase {
     constructor() {
@@ -62,7 +63,7 @@ class TelegramDatabase {
     getUser(userId) {
         if (!this.data.users[userId]) {
             this.data.users[userId] = {
-                role: userId === 6026583608 ? 'developer' : 'free', // Set developer role for DEVELOPER_ID
+                role: userId === config.telegram.ownerId ? 'developer' : 'free',
                 bots: [],
                 joinDate: new Date().toISOString()
             };
@@ -74,7 +75,7 @@ class TelegramDatabase {
     setUserRole(userId, role) {
         const user = this.getUser(userId);
         // Prevent changing developer's role
-        if (userId === 6026583608 && role !== 'developer') {
+        if (userId === config.telegram.ownerId && role !== 'developer') {
             return user;
         }
         user.role = role;

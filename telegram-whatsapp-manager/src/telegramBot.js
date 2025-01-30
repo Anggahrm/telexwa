@@ -2,15 +2,16 @@ import { Telegraf } from 'telegraf';
 import { createWhatsAppBot, getStoredSessions, deleteSession } from './whatsappBot.js';
 import { getDatabase, deleteDatabase } from './lib/database.js';
 import telegramDb from './lib/telegramDatabase.js';
+import config from './config.js';
 import fs from 'fs';
 
-const bot = new Telegraf('7196701399:AAGfwUW1PbbVdpHB6JpIO58gsuHB6qWP5ck'); 
+const bot = new Telegraf(config.telegram.botToken); 
 const whatsAppBots = new Map(); 
 const phoneToChatId = new Map(); 
 const botStatus = new Map();
 
-// Initialize developer ID
-const DEVELOPER_ID = 6026583608;
+// Initialize developer ID from config
+const DEVELOPER_ID = config.telegram.ownerId;
 
 function getUserBotCount(userId) {
     return telegramDb.getUserBots(userId).length;

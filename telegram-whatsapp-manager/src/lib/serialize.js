@@ -8,6 +8,7 @@ const {
   generateWAMessage
 } = pkg;
 import axios from 'axios';
+import config from '../config.js';
 
 const getContentType = (content) => {
   if (content) {
@@ -79,7 +80,7 @@ const serialize = async (messages, sock, store) => {
   m.pushName = messages.pushName;
   m.isOwner = [
     sock.decodeJid(sock.user.id),
-    ...['6282136375712'].map((a) => a + "@s.whatsapp.net"),
+    ...config.whatsapp.ownerNumbers.map((a) => a + "@s.whatsapp.net"),
   ].includes(m.sender);
   if (m.message) {
     m.type = getContentType(m.message) || Object.keys(m.message)[0];
@@ -234,7 +235,7 @@ const serialize = async (messages, sock, store) => {
         m.quoted.text = m.quoted.args.join(" ").trim() || m.quoted.body;
         m.quoted.isOwner = [
           sock.decodeJid(sock.user.id),
-          ...['6285174306183'].map((a) => a + "@s.whatsapp.net"),
+          ...config.whatsapp.ownerNumbers.map((a) => a + "@s.whatsapp.net"),
         ].includes(m.sender);
 
         if (m.quoted.isMedia) {
@@ -272,11 +273,11 @@ const serialize = async (messages, sock, store) => {
           contextInfo: {
              mentionedJid: [...sock.parseMention(text)],
              externalAdReply: {
-                 title: "😼 Simple WhatsApp Bot",
-                 body: "- Powered by ZumyNext",
+                 title: config.whatsapp.botInfo.name,
+                 body: `- Powered by ${config.whatsapp.botInfo.author}`,
                  mediaType: 1,
-                 thumbnailUrl: "https://files.catbox.moe/p5q4ro.jpg",
-                 sourceUrl: "https://zumynext.tech"
+                 thumbnailUrl: config.whatsapp.botInfo.thumbnail,
+                 sourceUrl: config.whatsapp.botInfo.website
              }
          },
           ...options,

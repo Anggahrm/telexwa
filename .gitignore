@@ -1,4 +1,5 @@
 /.vscode
+/telegram-whatsapp-manager/node_modules/
 /telegram-whatsapp-manager/sessions/
 /telegram-whatsapp-manager/logs/
 /telegram-whatsapp-manager/databases/

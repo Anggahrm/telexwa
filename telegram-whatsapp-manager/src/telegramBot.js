@@ -2,6 +2,7 @@ import { Telegraf } from 'telegraf';
 import { createWhatsAppBot, getStoredSessions, deleteSession } from './whatsappBot.js';
 import { getDatabase, deleteDatabase } from './lib/database.js';
 import telegramDb from './lib/telegramDatabase.js';
+import { getTelegramMenu } from './handlers/menu.js';
 import config from './config.js';
 import fs from 'fs';
 
@@ -51,6 +52,16 @@ async function loadStoredSessions() {
     }
     console.log(`Loaded ${sessions.length} stored WhatsApp sessions`);
 }
+
+bot.command(['start', 'menu'], (ctx) => {
+    const userId = ctx.from.id;
+    const user = telegramDb.getUser(userId);
+    const botCount = getUserBotCount(userId);
+    const limit = user.role === 'developer' ? Infinity : telegramDb.getRoleLimit(user.role);
+    
+    const menu = getTelegramMenu(user.role, botCount, limit);
+    ctx.replyWithMarkdown(menu);
+});
 
 bot.command('add', async (ctx) => {
     const userId = ctx.from.id;

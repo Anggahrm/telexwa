@@ -12,8 +12,8 @@ export default {
         
         // Bot info
         botInfo: {
-            name: 'Simple WhatsApp Bot',
-            author: 'ZumyNext',
+            name: 'ZumyNext Multi-Device',
+            author: 'anggahrm',
             website: 'https://zumynext.tech',
             thumbnail: 'https://files.catbox.moe/p5q4ro.jpg'
         }

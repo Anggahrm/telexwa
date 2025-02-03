@@ -1,56 +1,16 @@
-import { uploadImage } from '../lib/uploadImage.js';
-import { writeExif } from '../lib/sticker.js';
-import moment from 'moment-timezone';
-import axios from 'axios';
-import fs from 'fs';
 import { exec } from 'child_process';
+import fs from 'fs';
+import axios from 'axios';
+import { writeExif } from '../lib/sticker.js';
+import CaseManager from '../lib/case.js';
 
-export async function handleStoredMessage(m, sock, db) {
-    if (!m.isGroup || m.key.id.startsWith('BAE5')) return;
-    
-    const chat = db.initChat(m.cht);
-    const user = db.initUser(m.sender);
-    
-    if (chat.isBanned || user.banned) return;
-    
-    const msgs = chat.listStr;
-    const text = m.body.toUpperCase();
-    
-    if (!(text in msgs)) return;
-    
-    const storedItem = msgs[text];
-    
-    try {
-        if (storedItem && typeof storedItem === 'object') {
-            if (storedItem.image) {
-                await sock.sendMessage(m.cht, {
-                    image: { url: storedItem.image },
-                    caption: storedItem.text || '',
-                    mentions: m.mentions
-                });
-            } else if (storedItem.text) {
-                await sock.sendMessage(m.cht, {
-                    text: storedItem.text,
-                    mentions: m.mentions
-                });
-            }
-        }
-    } catch (error) {
-        console.error('Error sending stored message:', error);
-        await sock.sendMessage(m.cht, { 
-            text: '❌ Error sending stored message' 
-        });
-    }
-}
+const Case = new CaseManager("./system/case.js");
 
 export async function handleCommand(m, sock, db) {
-
-    const command = m.command;
-    const args = m.args;
-    const text = m.text;
-
-    switch (command) {
-        case 'addlist': {
+    const quoted = m.isQuoted ? m.quoted : m;
+    
+    switch (m.command) {
+        case "addlist": {
             if (!m.isGroup) {
                 await m.reply('This command can only be used in groups!');
                 return;
@@ -66,14 +26,14 @@ export async function handleCommand(m, sock, db) {
                 return;
             }
 
-            if (!text) {
+            if (!m.text) {
                 await m.reply('*🚩 Example:*\n!addlist Test');
                 return;
             }
 
             let msgs = db.data.chats[m.cht].listStr;
-            if (text.toUpperCase() in msgs) {
-                await m.reply(`'${text}' already exists in List store`);
+            if (m.text.toUpperCase() in msgs) {
+                await m.reply(`'${m.text}' already exists in List store`);
                 return;
             }
 
@@ -81,22 +41,22 @@ export async function handleCommand(m, sock, db) {
                 const media = await m.quoted.download();
                 const link = await uploadImage(media);
                 
-                msgs[text.toUpperCase()] = { 
+                msgs[m.text.toUpperCase()] = { 
                     image: link,
                     text: m.quoted.text || ''
                 };
             } else {
-                msgs[text.toUpperCase()] = {
+                msgs[m.text.toUpperCase()] = {
                     text: m.quoted.text || m.quoted.body || ''
                 };
             }
 
             db.saveDatabase();
-            await m.reply(`Successfully added "${text}" to List Store.\n\nAccess by typing its name`);
+            await m.reply(`Successfully added "${m.text}" to List Store.\n\nAccess by typing its name`);
             break;
         }
 
-        case 'dellist': {
+        case "dellist": {
             if (!m.isGroup) {
                 await m.reply('This command can only be used in groups!');
                 return;
@@ -107,27 +67,27 @@ export async function handleCommand(m, sock, db) {
                 return;
             }
 
-            if (!text) {
+            if (!m.text) {
                 await m.reply('*🚩 Example:*\n!dellist <name>\n\nUse !liststore to see available items.');
                 return;
             }
 
-            const upperText = text.toUpperCase();
+            const upperText = m.text.toUpperCase();
             let msgs = db.data.chats[m.cht].listStr;
 
             if (!(upperText in msgs)) {
-                await m.reply(`'${text}' is not registered in the List store`);
+                await m.reply(`'${m.text}' is not registered in the List store`);
                 return;
             }
 
             delete msgs[upperText];
             db.saveDatabase();
-            await m.reply(`Successfully deleted '${text}' from List Store.`);
+            await m.reply(`Successfully deleted '${m.text}' from List Store.`);
             break;
         }
 
-        case 'list':
-        case 'liststore': {
+        case "list":
+        case "liststore": {
             if (!m.isGroup) {
                 await m.reply('This command can only be used in groups!');
                 return;
@@ -163,8 +123,8 @@ export async function handleCommand(m, sock, db) {
             break;
         }
 
-        case 'brat': {
-            if (!text) {
+        case "brat": {
+            if (!m.quoted && !m.text) {
                 await m.reply('> Reply/Enter message to create brat sticker');
                 return;
             }
@@ -172,8 +132,8 @@ export async function handleCommand(m, sock, db) {
             await m.reply('⏳ Creating sticker...');
 
             try {
-                if (text.includes("--animated")) {
-                    const txt = text.replace("--animated", "").trim().split(" ");
+                if (m.text.includes("--animated")) {
+                    const txt = m.text.replace("--animated", "").trim().split(" ");
                     const array = [];
                     const tmpDir = './tmp';
                     
@@ -221,7 +181,7 @@ export async function handleCommand(m, sock, db) {
                     fs.existsSync(output) && fs.unlinkSync(output);
                 } else {
                     const { data } = await axios.get(
-                        `https://aqul-brat.hf.space/api/brat?text=${encodeURIComponent(text)}`,
+                        `https://aqul-brat.hf.space/api/brat?text=${encodeURIComponent(m.text)}`,
                         { responseType: 'arraybuffer' }
                     );
 
@@ -239,8 +199,8 @@ export async function handleCommand(m, sock, db) {
             break;
         }
 
-        case 'sticker':
-        case 's': {
+        case "sticker":
+        case "s": {
             if (!m.quoted) {
                 await m.reply('> Reply to photo or video to create sticker');
                 return;
@@ -273,5 +233,92 @@ export async function handleCommand(m, sock, db) {
             }
             break;
         }
+
+        case "cases": {
+            if (!m.isAdmin) {
+                await m.reply('This command can only be used by admins!');
+                return;
+            }
+
+            let cap = "*– 乂 Case Features –*\n";
+            cap += "> 📝 *`--add`* : Add new case feature\n";
+            cap += "> 🔄 *`--get`* : Get case feature\n";
+            cap += "> ❌ *`--delete`* : Delete case feature\n";
+            cap += "\n*– 乂 Available Cases –*\n";
+            cap += Case.list().map((a, i) => `> ${i + 1}. *${a}*`).join("\n");
+
+            if (!m.text) {
+                await m.reply(cap);
+                return;
+            }
+
+            if (m.text.includes("--add")) {
+                if (!m.quoted) {
+                    await m.reply('> ⚠️ Reply with case feature to save!');
+                    return;
+                }
+                let status = Case.add(m.quoted.body);
+                await m.reply(status ? '> ✅ Successfully added new case!' : '> ❌ Failed to add new case.');
+            } else if (m.text.includes("--delete")) {
+                let input = m.text.replace("--delete", "").trim();
+                if (!input) {
+                    await m.reply('> ⚠️ Enter case name to delete!');
+                    return;
+                }
+                let status = Case.delete(input);
+                await m.reply(status ? `> ✅ Successfully deleted case *${input}*!` : `> ❌ Case *${input}* not found!`);
+            } else if (m.text.includes("--get")) {
+                let input = m.text.replace("--get", "").trim();
+                if (!input) {
+                    await m.reply('> ⚠️ Enter case name to get!');
+                    return;
+                }
+                if (!Case.list().includes(input)) {
+                    await m.reply('> ❌ Case not found!');
+                    return;
+                }
+                let status = Case.get(input);
+                await m.reply(status ? status : `> ❌ Case *${input}* not found!`);
+            }
+            break;
+        }
+    }
+}
+
+export async function handleStoredMessage(m, sock, db) {
+    if (!m.isGroup || m.key.id.startsWith('BAE5')) return;
+    
+    const chat = db.initChat(m.cht);
+    const user = db.initUser(m.sender);
+    
+    if (chat.isBanned || user.banned) return;
+    
+    const msgs = chat.listStr;
+    const text = m.body.toUpperCase();
+    
+    if (!(text in msgs)) return;
+    
+    const storedItem = msgs[text];
+    
+    try {
+        if (storedItem && typeof storedItem === 'object') {
+            if (storedItem.image) {
+                await sock.sendMessage(m.cht, {
+                    image: { url: storedItem.image },
+                    caption: storedItem.text || '',
+                    mentions: m.mentions
+                });
+            } else if (storedItem.text) {
+                await sock.sendMessage(m.cht, {
+                    text: storedItem.text,
+                    mentions: m.mentions
+                });
+            }
+        }
+    } catch (error) {
+        console.error('Error sending stored message:', error);
+        await sock.sendMessage(m.cht, { 
+            text: '❌ Error sending stored message' 
+        });
     }
 }
